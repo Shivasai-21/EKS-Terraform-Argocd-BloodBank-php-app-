@@ -1,16 +1,160 @@
+
 pipeline {
     agent any
-    
+
+    environment {
+        scannerHome    = tool 'mysonar'
+        AWS_REGION     = 'ap-south-1'
+        AWS_ACCOUNT_ID = 'actual account id'
+        ECR_REPOSITORY = 'myrepo'
+        ECR_REGISTRY   = 'accountid.dkr.ecr.ap-south-1.amazonaws.com'
+    }
+
     stages {
-        stage ("cleanws") {
+
+        stage('Clean Workspace') {
             steps {
                 cleanWs()
             }
         }
-        stage ("code") {
+
+        stage('Checkout Code') {
             steps {
-                git 
+                git 'https://github.com/Shivasai-21/ltibbhackathon.git'
             }
+        }
+
+        stage('Code Quality Analysis') {
+            steps {
+                withSonarQubeEnv('mysonar') {
+                    sh '''
+                        set -eu
+                        "$scannerHome/bin/sonar-scanner" \
+                            -Dsonar.projectKey=MyProject
+                    '''
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Build Application Image') {
+            steps {
+                sh '''
+                    set -eu
+                    docker build \
+                        -t shivasai21/bb-php-app:app-image .
+                '''
+            }
+        }
+
+        stage('Build Database Image') {
+            steps {
+                sh '''
+                    set -eu
+                    docker build \
+                        -t shivasai21/bb-php-app:db-image database
+                '''
+            }
+        }
+
+        stage('Trivy Scan - Application') {
+            steps {
+                sh '''
+                    set -eu
+                    trivy image \
+                        --severity HIGH,CRITICAL \
+                        --exit-code 0 \
+                        --no-progress \
+                        shivasai21/bb-php-app:app-image
+                '''
+            }
+        }
+
+        stage('Trivy Scan - Database') {
+            steps {
+                sh '''
+                    set -eu
+                    trivy image \
+                        --severity HIGH,CRITICAL \
+                        --exit-code 0 \
+                        --no-progress \
+                        shivasai21/bb-php-app:db-image
+                '''
+            }
+        }
+
+        stage('Verify AWS IAM Identity') {
+            steps {
+                sh '''
+                    set -eu
+                    aws sts get-caller-identity
+                '''
+            }
+        }
+
+        stage('ECR Login') {
+            steps {
+                sh '''
+                    set -eu
+
+                    aws ecr get-login-password \
+                        --region "$AWS_REGION" |
+                    docker login \
+                        --username AWS \
+                        --password-stdin "$ECR_REGISTRY"
+                '''
+            }
+        }
+
+        stage('Tag Images for ECR') {
+            steps {
+                sh '''
+                    set -eu
+
+                    docker tag \
+                        shivasai21/bb-php-app:app-image \
+                        "$ECR_REGISTRY/$ECR_REPOSITORY:app-$BUILD_NUMBER"
+
+                    docker tag \
+                        shivasai21/bb-php-app:db-image \
+                        "$ECR_REGISTRY/$ECR_REPOSITORY:db-$BUILD_NUMBER"
+                '''
+            }
+        }
+
+        stage('Push Images to ECR') {
+            steps {
+                sh '''
+                    set -eu
+
+                    docker push \
+                        "$ECR_REGISTRY/$ECR_REPOSITORY:app-$BUILD_NUMBER"
+
+                    docker push \
+                        "$ECR_REGISTRY/$ECR_REPOSITORY:db-$BUILD_NUMBER"
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'SUCCESS: Both images passed Trivy scanning and were pushed to ECR.'
+        }
+
+        failure {
+            echo 'FAILED: Check the Jenkins console output for the failed stage.'
+        }
+
+        always {
+            sh 'docker logout "$ECR_REGISTRY" || true'
         }
     }
 }
